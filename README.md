@@ -1,3 +1,4 @@
+![screenshot](https://github.com/Desiringmachine/Market-Regimes-Dynamic/blob/main/Screenshot%202026-08-18%20145226.png)
 # Market Regimes (Dynamic) — NQStats [Desiringmachine]
 Volatility Regime Detection for Any Instrument
 
