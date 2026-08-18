@@ -1,0 +1,1279 @@
+//@version=6
+indicator("Market Regimes (Dynamic) - NQStats [Desiringmachine]", overlay = true, max_lines_count = 500, max_boxes_count = 500, max_labels_count = 500, dynamic_requests = true)
+
+// ============ CONSTANTS ============
+ROLL_LEN = input.int(10, "Roll (10d)", tooltip = "Rolling window: last N instances, used for the roll(10d) figure shown in the Daily/Session/Hourly panels.", inline="1",group = "Roll / Base - Daily / Session / Hourly",display = display.none)
+baseLookbackYears = input.int(5, "Base (5Y)", tooltip = "How many years of history are used to compute the Daily/Session/Hourly panels' dynamic baseline stdev (base(5Y)). Default 5y - increase/decrease as needed; a longer ticker history gives a more stable baseline.", inline="1", group = "Roll / Base - Daily / Session / Hourly", display = display.none)
+MIN_BASE_SAMPLES = 30   // minimum accumulated instances before the dynamic baseline is trusted (shows n/a until then)
+
+// ---- ROUND 8: Weekly / Monthly / Yearly now get their OWN roll length + base lookback,
+// independent of the D/S/H ones above. Defaults match the D/S/H defaults (10 / 5y) for
+// Weekly and Monthly, and match the previous hardcoded Yearly constants (5 / 30y) for
+// Yearly - so nothing changes numerically on first load, it's just now editable.
+lbGroupW = "Roll / Base - Weekly"
+ROLL_LEN_W         = input.int(10, "Roll (Weekly)", tooltip = "Rolling window (in weekly instances) used for the Weekly panel's roll(N) figure. Independent of the Daily/Session/Hourly Roll above.", inline="1", group = lbGroupW, display = display.none)
+baseLookbackYearsW = input.int(5, "Base (Weekly, yrs)", tooltip = "Years of history used for the Weekly panel's dynamic baseline stdev. Independent of the Daily/Session/Hourly Base above.", inline="1", group = lbGroupW, display = display.none)
+
+lbGroupM = "Roll / Base - Monthly"
+ROLL_LEN_M         = input.int(10, "Roll (Monthly)", tooltip = "Rolling window (in monthly instances) used for the Monthly panel's roll(N) figure. Independent of the Daily/Session/Hourly Roll above.", inline="1", group = lbGroupM, display = display.none)
+baseLookbackYearsM = input.int(5, "Base (Monthly, yrs)", tooltip = "Years of history used for the Monthly panel's dynamic baseline stdev. Independent of the Daily/Session/Hourly Base above.", inline="1", group = lbGroupM, display = display.none)
+
+lbGroupY = "Roll / Base - Yearly"
+ROLL_LEN_Y         = input.int(5, "Roll (Yearly)", tooltip = "Rolling window (in yearly instances) used for the Yearly panel's roll(N) figure. Was hardcoded to 5 - now editable.", inline="1", group = lbGroupY, display = display.none)
+baseLookbackYearsY = input.int(30, "Base (Yearly, yrs)", tooltip = "Years of history used for the Yearly panel's dynamic baseline stdev. Was hardcoded to 30 - now editable.", inline="1", group = lbGroupY, display = display.none)
+baseLookbackMsY = baseLookbackYearsY * 365.25 * 24.0 * 60.0 * 60.0 * 1000.0
+
+// ============ MONITOR 1 - DAILY ============
+monitor="Monitor 1 -> 6"
+// ============ MONITOR 2 - SESSION ============
+// ============ MONITOR 3 - HOURLY ============
+show3     = input.bool(true, "H", group = monitor, inline="1",display = display.none)
+hour3Mode = input.string("Auto (Current Hour)", "Hour Mode", options = ["Auto (Current Hour)", "18:00", "19:00", "20:00", "21:00", "22:00", "23:00", "00:00", "01:00", "02:00", "03:00", "04:00", "05:00", "06:00", "07:00", "08:00", "09:00", "10:00", "11:00", "12:00", "13:00", "14:00", "15:00"],inline="1", group = monitor, display = display.none)
+show2        = input.bool(true, "S",inline="1", group = monitor, display = display.none)
+session2Mode = input.string("Auto (Current Session)", "Session Mode", options = ["Auto (Current Session)", "Asia", "London", "NY AM", "NY PM"],inline="1", group = monitor, display = display.none)
+
+show1 = input.bool(true, "D",inline="3", group = monitor, display = display.none)
+showW = input.bool(false, "W",inline="3", group = monitor, display = display.none)
+showM = input.bool(false, "M",inline="3", group = monitor, display = display.none)
+showY = input.bool(false, "Y",inline="3", group = monitor, display = display.none)
+
+monitorcolorz="Regime Status"
+showRegimeStatus = input.bool(false, "Regime Status", group = monitorcolorz, display = display.none)
+showLiveLabel  = input.bool(true, "Live Label", tooltip = "Adds a 'live ##%' figure to each panel's HEADER TEXT showing where price sits RIGHT NOW inside the still-forming D/S/H/W/M/Y window, updated every chart tick. Independent of Live Marker / Live Square below. This does NOT change how base(5Y)/roll(10d) are built - those still require every bucket's completed history (see Round 4 note at bottom of script).", inline="live", group = monitorcolorz, display = display.none)
+showLiveRoll   = input.bool(true, "Live Roll'", tooltip = "Adds a 'roll' ##%' figure to each panel's HEADER TEXT showing the projected roll(N) value IF the current still-forming period closed right now - the same number the diamond (◆) is plotted at on the chart. Independent of Live Label / Live Marker / Live Square. Uses sqrt-time scaling when 'Scale ◆ Sqrt-Time' is ON.", inline="live", group = monitorcolorz, display = display.none)
+showLiveMarker = input.bool(true, "Live Marker ◆", tooltip = "Adds a live diamond (◆) + dotted lead-line to each panel's ROLLING-HISTORY CHART showing where price sits RIGHT NOW. Independent of Live Label / Live Square. (Round 8: the diamond's X position now also reflects how much of the current period has elapsed - see Round 8 note at bottom.)", inline="live", group = monitorcolorz, display = display.none)
+showLiveSquare = input.bool(true, "Live Square ■", tooltip = "Toggles which square is drawn in each panel (mutually exclusive with the static square - only one ■ shows at a time). ON: the square updates every tick, colored red/green/blue by how far the current live move sits relative to base(5Y). OFF: the square reflects the last COMPLETED instance's regime only - it 'stays as yesterday'.", inline="live2", group = monitorcolorz, display = display.none)
+showNSamp = input.bool(false, "N Sample", tooltip = "Show the number of samples (instances) feeding each monitor's base(5Y) baseline in the header, e.g. 'n=482'. Useful for confirming baseline stability / comparing sample counts across timeframes.", inline="1", group = monitorcolorz, display = display.none)
+scaleReturnSqrt = input.bool(true, "Scale ◆ Sqrt-Time", tooltip = "ON (recommended): before feeding the current partial-period return into the projected-roll formula, scale it up by sqrt(1/elapsedFrac) so it is comparable in magnitude to the full-period completed returns that surround it on the blue line. Example: if 7.5 months have elapsed (fracY≈0.63) and the raw return is +18%, the scaled return is 18%×sqrt(1/0.63)≈22.7%, giving the diamond a meaningfully different position from the last blue-line point. OFF: uses the raw partial return (old behaviour), which will always sit artificially close to the blue line early in any period. Minimum elapsed fraction threshold of 3% is applied to prevent blow-up on the very first bars of a new period.", inline="1", group = monitorcolorz, display = display.none)
+// ============ COLORS ============
+elevatedTh   = input.float(1.05, "Elevated thrshld >", inline="1", group = "Square Ratio", display = display.none)
+compressedTh = input.float(0.95, "Compressed thrshld <",inline="1", group = "Square Ratio", display = display.none)
+showCIBand = input.bool(true, "SE(SD) confidence band", tooltip = "Draws a shaded band (~95% CI) around the base(5Y) line using SE(SD) ~= SD / sqrt(2n). Also shown as a range in the header text.", inline="1", group = "SE(SD) Confidence Band", display = display.none)
+ciZ = input.float(1.96, "CI z-multiplier", tooltip = "1.96 ~= 95% CI, 1.645 ~= 90% CI, 2.58 ~= 99% CI", group = "SE(SD) Confidence Band", inline="1", display = display.none)
+
+// ============ -1 SD DISPLAY ============
+
+show1SDNeg = (false)
+//show1SDNeg = input.bool(false, "-1SD", group = "-1SD", tooltip = "ON: also draw a mirrored -1 SD line (at -baseline) in every monitor panel, in addition to the existing +1 SD baseline line.")
+
+//Monitor colors
+monitorcolors="Monitor Colors"
+headercolor= input.color(color.white, "Header", inline="1", group=monitorcolors, display = display.none)
+headerSizeMode = input.string("Small", "Txt Size", inline="1", options = ["Small", "Normal", "Large"], group = monitorcolors, display = display.none)
+linecolor=input.color(color.blue, "Roll", inline="1", group=monitorcolors, display = display.none)
+SDcolor=input.color(color.yellow, "SD", inline="1", group=monitorcolors, display = display.none)
+CIbandcolor = input.color(color.new(color.yellow, 85), "SE",inline="1", group=monitorcolors, display = display.none)
+backgroundcolor=  input.color(color.new(color.navy, 88), "Fill", inline="1",  group=monitorcolors, display = display.none)
+bordercolorr=  input.color(color.new(color.gray, 60), "Border", inline="1", group=monitorcolors, display = display.none)
+liveColor = input.color(color.orange, "Live", inline="1", group=monitorcolors, display = display.none)
+headerSize = headerSizeMode == "Small" ? size.small : headerSizeMode == "Large" ? size.large : size.normal
+
+// ============ LAYOUT / STYLE ============
+histBarsToShow = input.int(136, "Bars to Show", inline="1", group = "Layout", tooltip = "How many historical Daily/Session/Hourly instances are drawn in each monitor's rolling-history chart. Capped at 150 so 3 monitors together stay under TradingView's 500-line limit.", display = display.none)
+barSpacing     = input.int(1, "Bar Space", inline="1", group = "Layout", tooltip = "Horizontal spacing (in chart bars) between each column of the rolling-history chart.", display = display.none)
+
+xOff           = input.int(20, "Horiz offs", inline="1", group = "Layout", display = display.none)
+panelHeightPct = input.float(0.09, "Height", inline="1", group = "Layout", display = display.none)
+panelGapPct    = input.float(0.03, "Gap", inline="1", group = "Layout", display = display.none)
+lookbackRange  = input.int(300, "Daily bars", inline="1", minval = 30, group = "Layout", tooltip = "Number of DAILY bars (not chart bars) used to size the monitors. Anchoring this to the Daily timeframe is what keeps panel size constant regardless of your chart's own timeframe.", display = display.none)
+
+// ============ TIMEZONE ============
+nyTz = "America/New_York"
+monthNames = array.from("Jan", "Feb", "Mar", "Apr", "May", "Jun", "Jul", "Aug", "Sep", "Oct", "Nov", "Dec")
+
+// Time window (ms) used to prune each dynamic 5Y (or custom N-year) baseline array
+baseLookbackMs  = baseLookbackYears  * 365.25 * 24.0 * 60.0 * 60.0 * 1000.0
+baseLookbackMsW = baseLookbackYearsW * 365.25 * 24.0 * 60.0 * 60.0 * 1000.0
+baseLookbackMsM = baseLookbackYearsM * 365.25 * 24.0 * 60.0 * 60.0 * 1000.0
+
+// Yearly panel history length (matches every other monitor's own history length, no
+// artificial cap)
+yearlyNDays = histBarsToShow
+
+// ============ AUTO-KEY HELPERS (Monitor 2 / Monitor 3) ============
+f_autoSessionKey(curHourNY) =>
+    string k = ""
+    if curHourNY >= 20 or curHourNY <= 1
+        k := "Asia"
+    else if curHourNY >= 2 and curHourNY <= 7
+        k := "London"
+    else if curHourNY >= 8 and curHourNY <= 11
+        k := "NY AM"
+    else if curHourNY >= 12 and curHourNY <= 15
+        k := "NY PM"
+    k
+
+f_autoHourKey(curHourNY) =>
+    (curHourNY == 16 or curHourNY == 17) ? "" : str.tostring(curHourNY, "00") + ":00"
+
+// Display-only helper: strip the ":00" suffix so the header shows "H 09" instead of
+// "H 09:00". Only affects the label text - selHourKey itself (with ":00") is still used
+// internally for the "outside covered hours" gap check.
+f_hourShort(k) =>
+    str.substring(k, 0, 2)
+
+// ---- LIVE (round 4) helpers: chart-resolution, current-window-open trackers ----
+// These are deliberately separate from the base(5Y)/roll(10d) trackers below. They
+// don't accumulate history and don't feed the baseline - they only answer "what is
+// today/this session/this hour's return SO FAR, right now, on this tick". Because
+// they key off the SAME auto-detected session/hour bounds every bar, a single call
+// site can serve "Auto" mode correctly even though the underlying window it's
+// watching changes several times a day (see round 4 changelog note at bottom).
+f_track_window_open(startHour, endHour, hourNow) =>
+    var float wOpen = na
+    var bool  wasIn = false
+    wrap = startHour > endHour
+    curIn = wrap ? (hourNow >= startHour or hourNow <= endHour) : (hourNow >= startHour and hourNow <= endHour)
+    if curIn and not wasIn
+        wOpen := open
+    if not curIn
+        wOpen := na
+    wasIn := curIn
+    wOpen
+
+f_track_hour_open(targetHour, hourNow) =>
+    var float wOpen = na
+    var bool  wasIn = false
+    curIn = hourNow == targetHour
+    if curIn and not wasIn
+        wOpen := open
+    if not curIn
+        wOpen := na
+    wasIn := curIn
+    wOpen
+
+f_sessionBounds(string key) =>
+    int sH = -1
+    int eH = -1
+    if key == "Asia"
+        sH := 20
+        eH := 1
+    else if key == "London"
+        sH := 2
+        eH := 7
+    else if key == "NY AM"
+        sH := 8
+        eH := 11
+    else if key == "NY PM"
+        sH := 12
+        eH := 15
+    [sH, eH]
+
+f_liveRet(float o, float px) =>
+    not na(o) and o != 0 ? (px - o) / o : float(na)
+
+// ---- ROUND 8: elapsed-fraction helpers ----
+// These answer "how far through the CURRENT still-forming D/W/M/Y/S/H window are we,
+// right now, as a 0..1 fraction". They feed ONLY the diamond's X position (see
+// f_drawActivePanel's new elapsedFrac param) - they do not touch retHist/baseRet/
+// histArr/liveVal/liveRollProj, so none of the actual roll/base/live-return math
+// changes. Purely a "where does the diamond sit horizontally" concern.
+f_elapsedFrac(openT, closeT) =>
+    float result = 0.0
+    if not na(openT) and not na(closeT) and closeT > openT
+        result := (time - openT) / (closeT - openT)
+        result := math.max(0.0, math.min(1.0, result))
+    result
+
+f_periodElapsedFrac(sH, eH, hourNow, minuteNow) =>
+    // sH/eH describe an hour-of-day window (NY time), inclusive, possibly wrapping
+    // past midnight (e.g. Asia 20 -> 1). totalHours counts whole hours in the window;
+    // elapsedHours counts whole hours since the window opened; the current hour's
+    // partial progress is added via minuteNow/60.
+    wrap = sH > eH
+    totalHours = wrap ? (24 - sH + eH + 1) : (eH - sH + 1)
+    elapsedHours = wrap ? (hourNow >= sH ? hourNow - sH : 24 - sH + hourNow) : (hourNow - sH)
+    frac = totalHours > 0 ? (elapsedHours + minuteNow / 60.0) / totalHours : 0.0
+    math.max(0.0, math.min(1.0, frac))
+
+// ============ TRACKING FUNCTIONS ============
+// MEMORY FIX: per TradingView's own guidance for RE10139
+// (https://www.tradingview.com/pine-script-docs/errors/RE10139/#return-the-last-state-only),
+// a request.security() call stores a COPY of whatever it returns on every single bar of
+// the chart's history, so that `[1]`-style history-referencing keeps working. For a
+// dashboard like this one - which only ever needs the CURRENT/latest state, never a
+// per-bar history of the returned value - that per-bar storage is pure waste. The fix:
+// every tracker below now returns real data (roll value, history arrays, base(5Y),
+// SE(SD), nSamp) ONLY on `barstate.islast` of its OWN context, `na` on every other bar.
+//
+// STABILITY FIX (earlier update): f_trackSession_HTF previously read `open`/`close` of
+// the CURRENT (still-forming) bar directly at the moment a session boundary was crossed,
+// which was sensitive to chart resolution under lookahead_on. It now reads open[1]/close[1]
+// against time[1] - the previous, FULLY CONFIRMED bar - same pattern as f_trackDaily_HTF.
+f_trackDaily_HTF(rLen, hLen, lookbackMs, minSamples) =>
+    var array<float> retHist    = array.new_float(0)
+    var array<float> histArr    = array.new_float(0)
+    var array<int>   histTimes  = array.new_int(0)
+    var array<float> baseRet    = array.new_float(0)
+    var array<int>   baseTimes  = array.new_int(0)
+    var float lastRoll  = na
+    var float dynBase   = na
+    var float dynBaseSE = na
+    var int   dynNSamp  = na
+    if barstate.isnew and not na(open[1]) and open[1] != 0
+        ret = (close[1] - open[1]) / open[1]
+        array.push(retHist, ret)
+        if array.size(retHist) > rLen
+            array.shift(retHist)
+
+        array.push(baseRet, ret)
+        array.push(baseTimes, time[1])
+        while array.size(baseTimes) > 0 and (time[1] - array.get(baseTimes, 0)) > lookbackMs
+            array.shift(baseRet)
+            array.shift(baseTimes)
+        nSamp = array.size(baseRet)
+        dynNSamp := nSamp
+        dynBase := nSamp >= minSamples ? array.stdev(baseRet, false) : na
+        dynBaseSE := not na(dynBase) ? dynBase / math.sqrt(2 * nSamp) : na
+
+        lastRoll := array.size(retHist) == rLen ? array.stdev(retHist, false) : na
+        array.push(histArr, lastRoll)
+        array.push(histTimes, time[1])
+        if array.size(histArr) > hLen
+            array.shift(histArr)
+            array.shift(histTimes)
+
+    array<float> naFloatArr = na
+    array<int>   naIntArr   = na
+    if barstate.islast
+        [lastRoll, histArr, histTimes, dynBase, dynBaseSE, dynNSamp, array.copy(retHist)]
+    else
+        [float(na), naFloatArr, naIntArr, float(na), float(na), int(na), naFloatArr]
+
+f_trackSession_HTF(sH, eH, rLen, hLen, lookbackMs, minSamples) =>
+    var float p_open  = na
+    var float p_close = na
+    var bool  wasIn   = false
+    var array<float> retHist   = array.new_float(0)
+    var array<float> histArr   = array.new_float(0)
+    var array<int>   histTimes = array.new_int(0)
+    var array<float> baseRet   = array.new_float(0)
+    var array<int>   baseTimes = array.new_int(0)
+    var float lastRoll  = na
+    var float dynBase   = na
+    var float dynBaseSE = na
+    var int   dynNSamp  = na
+    wrap = sH > eH
+    if barstate.isnew and not na(open[1])
+        hhVal = hour(time[1], nyTz)
+        curIn = wrap ? (hhVal >= sH or hhVal <= eH) : (hhVal >= sH and hhVal <= eH)
+        if curIn and not wasIn
+            p_open := open[1]
+            p_close := na
+        if curIn
+            p_close := close[1]
+        if wasIn and not curIn
+            ret = (not na(p_open) and not na(p_close) and p_open != 0) ? (p_close - p_open) / p_open : na
+            if not na(ret)
+                array.push(retHist, ret)
+                if array.size(retHist) > rLen
+                    array.shift(retHist)
+
+                array.push(baseRet, ret)
+                array.push(baseTimes, time[1])
+                while array.size(baseTimes) > 0 and (time[1] - array.get(baseTimes, 0)) > lookbackMs
+                    array.shift(baseRet)
+                    array.shift(baseTimes)
+                nSamp = array.size(baseRet)
+                dynNSamp := nSamp
+                dynBase := nSamp >= minSamples ? array.stdev(baseRet, false) : na
+                dynBaseSE := not na(dynBase) ? dynBase / math.sqrt(2 * nSamp) : na
+
+                lastRoll := array.size(retHist) == rLen ? array.stdev(retHist, false) : na
+                array.push(histArr, lastRoll)
+                array.push(histTimes, time[1])
+                if array.size(histArr) > hLen
+                    array.shift(histArr)
+                    array.shift(histTimes)
+        wasIn := curIn
+
+    array<float> naFloatArr = na
+    array<int>   naIntArr   = na
+    if barstate.islast
+        [lastRoll, histArr, histTimes, dynBase, dynBaseSE, dynNSamp, array.copy(retHist)]
+    else
+        [float(na), naFloatArr, naIntArr, float(na), float(na), int(na), naFloatArr]
+
+// Yearly returns derived directly from confirmed DAILY bars instead of TradingView's
+// native "12M" resolution - see the round-2 changelog at the bottom for the full
+// rationale (avoids the ~2-year confirmation lag and any "12M" bar-construction
+// irregularities around contract-roll dates for continuous futures).
+f_trackYearlyFromDaily(rLen, hLen, lookbackMs, minSamples) =>
+    var array<float> retHist   = array.new_float(0)
+    var array<float> histArr   = array.new_float(0)
+    var array<int>   histTimes = array.new_int(0)
+    var array<float> baseRet   = array.new_float(0)
+    var array<int>   baseTimes = array.new_int(0)
+    var float lastRoll  = na
+    var float dynBase   = na
+    var float dynBaseSE = na
+    var int   dynNSamp  = na
+    var int   curYear       = na
+    var float yearOpen      = na
+    var float yearClose     = na
+    var int   yearCloseTime = na
+
+    if barstate.isnew and not na(open[1])
+        y = year(time[1], nyTz)
+        if na(curYear)
+            curYear := y
+            yearOpen := open[1]
+        else if y != curYear
+            ret = (not na(yearOpen) and not na(yearClose) and yearOpen != 0) ? (yearClose - yearOpen) / yearOpen : na
+            if not na(ret)
+                array.push(retHist, ret)
+                if array.size(retHist) > rLen
+                    array.shift(retHist)
+
+                array.push(baseRet, ret)
+                array.push(baseTimes, yearCloseTime)
+                while array.size(baseTimes) > 0 and (yearCloseTime - array.get(baseTimes, 0)) > lookbackMs
+                    array.shift(baseRet)
+                    array.shift(baseTimes)
+                nSamp = array.size(baseRet)
+                dynNSamp := nSamp
+                dynBase := nSamp >= minSamples ? array.stdev(baseRet, false) : na
+                dynBaseSE := not na(dynBase) ? dynBase / math.sqrt(2 * nSamp) : na
+
+                lastRoll := array.size(retHist) == rLen ? array.stdev(retHist, false) : na
+                array.push(histArr, lastRoll)
+                array.push(histTimes, yearCloseTime)
+                if array.size(histArr) > hLen
+                    array.shift(histArr)
+                    array.shift(histTimes)
+            curYear := y
+            yearOpen := open[1]
+        yearClose := close[1]
+        yearCloseTime := time[1]
+
+    array<float> naFloatArr = na
+    array<int>   naIntArr   = na
+    if barstate.islast
+        [lastRoll, histArr, histTimes, dynBase, dynBaseSE, dynNSamp, array.copy(retHist)]
+    else
+        [float(na), naFloatArr, naIntArr, float(na), float(na), int(na), naFloatArr]
+
+// ============ CONSOLIDATED WRAPPERS ============
+// A fixed session/hour selection only ever needs ONE bucket tracked - the other 3/22
+// are pure overhead if they're never displayed. "Auto" mode needs all of them alive
+// since which bucket is "current" changes every bar. This keeps the number of
+// concurrently-maintained 5-year trackers inside each single request.security() call
+// to the minimum the current setting actually requires.
+f_allSessions(rLen, hLen, lookbackMs, minSamples, modeSel, curHourNY) =>
+    float outRoll = na
+    array<float> outHistArr = na
+    array<int>   outHistTimes = na
+    float outBase = na
+    float outBaseSE = na
+    int   outNSamp = na
+    array<float> outRetHist = na
+    string selKey = ""
+
+    if modeSel == "Auto (Current Session)"
+        [asiaRoll, asiaHistArr, asiaHistTimes, asiaBase, asiaBaseSE, asiaNSamp, asiaRetHist]         = f_trackSession_HTF(20, 1, rLen, hLen, lookbackMs, minSamples)
+        [londonRoll, londonHistArr, londonHistTimes, londonBase, londonBaseSE, londonNSamp, londonRetHist] = f_trackSession_HTF(2, 7, rLen, hLen, lookbackMs, minSamples)
+        [amRoll, amHistArr, amHistTimes, amBase, amBaseSE, amNSamp, amRetHist]                   = f_trackSession_HTF(8, 11, rLen, hLen, lookbackMs, minSamples)
+        [pmRoll, pmHistArr, pmHistTimes, pmBase, pmBaseSE, pmNSamp, pmRetHist]                   = f_trackSession_HTF(12, 15, rLen, hLen, lookbackMs, minSamples)
+        selKey := f_autoSessionKey(curHourNY)
+        if selKey == "Asia"
+            outRoll := asiaRoll
+            outHistArr := asiaHistArr
+            outHistTimes := asiaHistTimes
+            outBase := asiaBase
+            outBaseSE := asiaBaseSE
+            outNSamp := asiaNSamp
+            outRetHist := asiaRetHist
+        else if selKey == "London"
+            outRoll := londonRoll
+            outHistArr := londonHistArr
+            outHistTimes := londonHistTimes
+            outBase := londonBase
+            outBaseSE := londonBaseSE
+            outNSamp := londonNSamp
+            outRetHist := londonRetHist
+        else if selKey == "NY AM"
+            outRoll := amRoll
+            outHistArr := amHistArr
+            outHistTimes := amHistTimes
+            outBase := amBase
+            outBaseSE := amBaseSE
+            outNSamp := amNSamp
+            outRetHist := amRetHist
+        else if selKey == "NY PM"
+            outRoll := pmRoll
+            outHistArr := pmHistArr
+            outHistTimes := pmHistTimes
+            outBase := pmBase
+            outBaseSE := pmBaseSE
+            outNSamp := pmNSamp
+            outRetHist := pmRetHist
+    else
+        int sH = na
+        int eH = na
+        if modeSel == "Asia"
+            sH := 20
+            eH := 1
+        else if modeSel == "London"
+            sH := 2
+            eH := 7
+        else if modeSel == "NY AM"
+            sH := 8
+            eH := 11
+        else if modeSel == "NY PM"
+            sH := 12
+            eH := 15
+        [r, ha, ht, b, se, ns, rh] = f_trackSession_HTF(sH, eH, rLen, hLen, lookbackMs, minSamples)
+        outRoll := r
+        outHistArr := ha
+        outHistTimes := ht
+        outBase := b
+        outBaseSE := se
+        outNSamp := ns
+        outRetHist := rh
+        selKey := modeSel
+    [outRoll, outHistArr, outHistTimes, outBase, outBaseSE, outNSamp, outRetHist, selKey]
+
+f_allHours(rLen, hLen, lookbackMs, minSamples, modeSel) =>
+    curH = hour(time, nyTz)
+    string selKey = ""
+    float outRoll = na
+    array<float> outHistArr = na
+    array<int>   outHistTimes = na
+    float outBase = na
+    float outBaseSE = na
+    int   outNSamp = na
+    array<float> outRetHist = na
+
+    if modeSel == "Auto (Current Hour)"
+        selKey := f_autoHourKey(curH)
+        [h18Roll, h18HA, h18HT, h18Base, h18BaseSE, h18NSamp, h18RH] = f_trackSession_HTF(18, 18, rLen, hLen, lookbackMs, minSamples)
+        [h19Roll, h19HA, h19HT, h19Base, h19BaseSE, h19NSamp, h19RH] = f_trackSession_HTF(19, 19, rLen, hLen, lookbackMs, minSamples)
+        [h20Roll, h20HA, h20HT, h20Base, h20BaseSE, h20NSamp, h20RH] = f_trackSession_HTF(20, 20, rLen, hLen, lookbackMs, minSamples)
+        [h21Roll, h21HA, h21HT, h21Base, h21BaseSE, h21NSamp, h21RH] = f_trackSession_HTF(21, 21, rLen, hLen, lookbackMs, minSamples)
+        [h22Roll, h22HA, h22HT, h22Base, h22BaseSE, h22NSamp, h22RH] = f_trackSession_HTF(22, 22, rLen, hLen, lookbackMs, minSamples)
+        [h23Roll, h23HA, h23HT, h23Base, h23BaseSE, h23NSamp, h23RH] = f_trackSession_HTF(23, 23, rLen, hLen, lookbackMs, minSamples)
+        [h00Roll, h00HA, h00HT, h00Base, h00BaseSE, h00NSamp, h00RH] = f_trackSession_HTF(0, 0, rLen, hLen, lookbackMs, minSamples)
+        [h01Roll, h01HA, h01HT, h01Base, h01BaseSE, h01NSamp, h01RH] = f_trackSession_HTF(1, 1, rLen, hLen, lookbackMs, minSamples)
+        [h02Roll, h02HA, h02HT, h02Base, h02BaseSE, h02NSamp, h02RH] = f_trackSession_HTF(2, 2, rLen, hLen, lookbackMs, minSamples)
+        [h03Roll, h03HA, h03HT, h03Base, h03BaseSE, h03NSamp, h03RH] = f_trackSession_HTF(3, 3, rLen, hLen, lookbackMs, minSamples)
+        [h04Roll, h04HA, h04HT, h04Base, h04BaseSE, h04NSamp, h04RH] = f_trackSession_HTF(4, 4, rLen, hLen, lookbackMs, minSamples)
+        [h05Roll, h05HA, h05HT, h05Base, h05BaseSE, h05NSamp, h05RH] = f_trackSession_HTF(5, 5, rLen, hLen, lookbackMs, minSamples)
+        [h06Roll, h06HA, h06HT, h06Base, h06BaseSE, h06NSamp, h06RH] = f_trackSession_HTF(6, 6, rLen, hLen, lookbackMs, minSamples)
+        [h07Roll, h07HA, h07HT, h07Base, h07BaseSE, h07NSamp, h07RH] = f_trackSession_HTF(7, 7, rLen, hLen, lookbackMs, minSamples)
+        [h08Roll, h08HA, h08HT, h08Base, h08BaseSE, h08NSamp, h08RH] = f_trackSession_HTF(8, 8, rLen, hLen, lookbackMs, minSamples)
+        [h09Roll, h09HA, h09HT, h09Base, h09BaseSE, h09NSamp, h09RH] = f_trackSession_HTF(9, 9, rLen, hLen, lookbackMs, minSamples)
+        [h10Roll, h10HA, h10HT, h10Base, h10BaseSE, h10NSamp, h10RH] = f_trackSession_HTF(10, 10, rLen, hLen, lookbackMs, minSamples)
+        [h11Roll, h11HA, h11HT, h11Base, h11BaseSE, h11NSamp, h11RH] = f_trackSession_HTF(11, 11, rLen, hLen, lookbackMs, minSamples)
+        [h12Roll, h12HA, h12HT, h12Base, h12BaseSE, h12NSamp, h12RH] = f_trackSession_HTF(12, 12, rLen, hLen, lookbackMs, minSamples)
+        [h13Roll, h13HA, h13HT, h13Base, h13BaseSE, h13NSamp, h13RH] = f_trackSession_HTF(13, 13, rLen, hLen, lookbackMs, minSamples)
+        [h14Roll, h14HA, h14HT, h14Base, h14BaseSE, h14NSamp, h14RH] = f_trackSession_HTF(14, 14, rLen, hLen, lookbackMs, minSamples)
+        [h15Roll, h15HA, h15HT, h15Base, h15BaseSE, h15NSamp, h15RH] = f_trackSession_HTF(15, 15, rLen, hLen, lookbackMs, minSamples)
+
+        if selKey == "18:00"
+            outRoll := h18Roll
+            outHistArr := h18HA
+            outHistTimes := h18HT
+            outBase := h18Base
+            outBaseSE := h18BaseSE
+            outNSamp := h18NSamp
+            outRetHist := h18RH
+        else if selKey == "19:00"
+            outRoll := h19Roll
+            outHistArr := h19HA
+            outHistTimes := h19HT
+            outBase := h19Base
+            outBaseSE := h19BaseSE
+            outNSamp := h19NSamp
+            outRetHist := h19RH
+        else if selKey == "20:00"
+            outRoll := h20Roll
+            outHistArr := h20HA
+            outHistTimes := h20HT
+            outBase := h20Base
+            outBaseSE := h20BaseSE
+            outNSamp := h20NSamp
+            outRetHist := h20RH
+        else if selKey == "21:00"
+            outRoll := h21Roll
+            outHistArr := h21HA
+            outHistTimes := h21HT
+            outBase := h21Base
+            outBaseSE := h21BaseSE
+            outNSamp := h21NSamp
+            outRetHist := h21RH
+        else if selKey == "22:00"
+            outRoll := h22Roll
+            outHistArr := h22HA
+            outHistTimes := h22HT
+            outBase := h22Base
+            outBaseSE := h22BaseSE
+            outNSamp := h22NSamp
+            outRetHist := h22RH
+        else if selKey == "23:00"
+            outRoll := h23Roll
+            outHistArr := h23HA
+            outHistTimes := h23HT
+            outBase := h23Base
+            outBaseSE := h23BaseSE
+            outNSamp := h23NSamp
+            outRetHist := h23RH
+        else if selKey == "00:00"
+            outRoll := h00Roll
+            outHistArr := h00HA
+            outHistTimes := h00HT
+            outBase := h00Base
+            outBaseSE := h00BaseSE
+            outNSamp := h00NSamp
+            outRetHist := h00RH
+        else if selKey == "01:00"
+            outRoll := h01Roll
+            outHistArr := h01HA
+            outHistTimes := h01HT
+            outBase := h01Base
+            outBaseSE := h01BaseSE
+            outNSamp := h01NSamp
+            outRetHist := h01RH
+        else if selKey == "02:00"
+            outRoll := h02Roll
+            outHistArr := h02HA
+            outHistTimes := h02HT
+            outBase := h02Base
+            outBaseSE := h02BaseSE
+            outNSamp := h02NSamp
+            outRetHist := h02RH
+        else if selKey == "03:00"
+            outRoll := h03Roll
+            outHistArr := h03HA
+            outHistTimes := h03HT
+            outBase := h03Base
+            outBaseSE := h03BaseSE
+            outNSamp := h03NSamp
+            outRetHist := h03RH
+        else if selKey == "04:00"
+            outRoll := h04Roll
+            outHistArr := h04HA
+            outHistTimes := h04HT
+            outBase := h04Base
+            outBaseSE := h04BaseSE
+            outNSamp := h04NSamp
+            outRetHist := h04RH
+        else if selKey == "05:00"
+            outRoll := h05Roll
+            outHistArr := h05HA
+            outHistTimes := h05HT
+            outBase := h05Base
+            outBaseSE := h05BaseSE
+            outNSamp := h05NSamp
+            outRetHist := h05RH
+        else if selKey == "06:00"
+            outRoll := h06Roll
+            outHistArr := h06HA
+            outHistTimes := h06HT
+            outBase := h06Base
+            outBaseSE := h06BaseSE
+            outNSamp := h06NSamp
+            outRetHist := h06RH
+        else if selKey == "07:00"
+            outRoll := h07Roll
+            outHistArr := h07HA
+            outHistTimes := h07HT
+            outBase := h07Base
+            outBaseSE := h07BaseSE
+            outNSamp := h07NSamp
+            outRetHist := h07RH
+        else if selKey == "08:00"
+            outRoll := h08Roll
+            outHistArr := h08HA
+            outHistTimes := h08HT
+            outBase := h08Base
+            outBaseSE := h08BaseSE
+            outNSamp := h08NSamp
+            outRetHist := h08RH
+        else if selKey == "09:00"
+            outRoll := h09Roll
+            outHistArr := h09HA
+            outHistTimes := h09HT
+            outBase := h09Base
+            outBaseSE := h09BaseSE
+            outNSamp := h09NSamp
+            outRetHist := h09RH
+        else if selKey == "10:00"
+            outRoll := h10Roll
+            outHistArr := h10HA
+            outHistTimes := h10HT
+            outBase := h10Base
+            outBaseSE := h10BaseSE
+            outNSamp := h10NSamp
+            outRetHist := h10RH
+        else if selKey == "11:00"
+            outRoll := h11Roll
+            outHistArr := h11HA
+            outHistTimes := h11HT
+            outBase := h11Base
+            outBaseSE := h11BaseSE
+            outNSamp := h11NSamp
+            outRetHist := h11RH
+        else if selKey == "12:00"
+            outRoll := h12Roll
+            outHistArr := h12HA
+            outHistTimes := h12HT
+            outBase := h12Base
+            outBaseSE := h12BaseSE
+            outNSamp := h12NSamp
+            outRetHist := h12RH
+        else if selKey == "13:00"
+            outRoll := h13Roll
+            outHistArr := h13HA
+            outHistTimes := h13HT
+            outBase := h13Base
+            outBaseSE := h13BaseSE
+            outNSamp := h13NSamp
+            outRetHist := h13RH
+        else if selKey == "14:00"
+            outRoll := h14Roll
+            outHistArr := h14HA
+            outHistTimes := h14HT
+            outBase := h14Base
+            outBaseSE := h14BaseSE
+            outNSamp := h14NSamp
+            outRetHist := h14RH
+        else if selKey == "15:00"
+            outRoll := h15Roll
+            outHistArr := h15HA
+            outHistTimes := h15HT
+            outBase := h15Base
+            outBaseSE := h15BaseSE
+            outNSamp := h15NSamp
+            outRetHist := h15RH
+    else
+        // Fixed hour selected - only build/maintain that single bucket.
+        hh = int(str.tonumber(str.substring(modeSel, 0, 2)))
+        [r, ha, ht, b, se, ns, rh] = f_trackSession_HTF(hh, hh, rLen, hLen, lookbackMs, minSamples)
+        outRoll := r
+        outHistArr := ha
+        outHistTimes := ht
+        outBase := b
+        outBaseSE := se
+        outNSamp := ns
+        outRetHist := rh
+        selKey := modeSel
+    [outRoll, outHistArr, outHistTimes, outBase, outBaseSE, outNSamp, outRetHist, selKey]
+
+// ============ FIXED-TIMEFRAME DATA & ARRAY ENGINES ============
+[fullH_D, fullL_D, atr_D] = request.security(syminfo.tickerid, "D", [ta.highest(high, lookbackRange), ta.lowest(low, lookbackRange), ta.atr(14)], lookahead = barmerge.lookahead_off)
+
+// Every call below returns real data ONLY on the source timeframe's own last bar (see
+// the big comment above the tracking functions) - so on nearly every bar these outputs
+// are simply `na`, and Pine only ever needs to keep ONE snapshot of each, not one per
+// chart bar.
+
+// Yearly (derived from Daily - see f_trackYearlyFromDaily above). ROLL_LEN_Y /
+// baseLookbackMsY are now inputs (round 8) instead of hardcoded constants.
+[yearlyRoll, yearlyHistArr, yearlyHistTimes, yearlyBase, yearlyBaseSE, yearlyNSamp, yearlyRetHist] = request.security(syminfo.tickerid, "D", f_trackYearlyFromDaily(ROLL_LEN_Y, yearlyNDays, baseLookbackMsY, 5), lookahead = barmerge.lookahead_off)
+
+// Monthly (M) - now uses its own ROLL_LEN_M / baseLookbackMsM (round 8), independent of
+// the Daily/Session/Hourly ROLL_LEN / baseLookbackMs.
+[monthlyRoll, monthlyHistArr, monthlyHistTimes, monthlyBase, monthlyBaseSE, monthlyNSamp, monthlyRetHist] = request.security(syminfo.tickerid, "M", f_trackDaily_HTF(ROLL_LEN_M, histBarsToShow, baseLookbackMsM, MIN_BASE_SAMPLES), lookahead = barmerge.lookahead_on)
+
+// Weekly (W) - now uses its own ROLL_LEN_W / baseLookbackMsW (round 8), independent of
+// the Daily/Session/Hourly ROLL_LEN / baseLookbackMs.
+[weeklyRoll, weeklyHistArr, weeklyHistTimes, weeklyBase, weeklyBaseSE, weeklyNSamp, weeklyRetHist] = request.security(syminfo.tickerid, "W", f_trackDaily_HTF(ROLL_LEN_W, histBarsToShow, baseLookbackMsW, MIN_BASE_SAMPLES), lookahead = barmerge.lookahead_on)
+
+// Daily (D)
+[dailyRoll, dailyHistArr, dailyHistTimes, dailyBase, dailyBaseSE, dailyNSamp, dailyRetHist] = request.security(syminfo.tickerid, "D", f_trackDaily_HTF(ROLL_LEN, histBarsToShow, baseLookbackMs, MIN_BASE_SAMPLES), lookahead = barmerge.lookahead_on)
+
+// Sessions (60) - ONE consolidated call, and only the selected session's tracker is
+// actually maintained unless "Auto" mode requires all 4 to stay warm.
+//
+// N-SAMPLE ACROSS CHART TF (H/S) - PLATFORM LIMIT, NOT SCRIPT-FIXABLE:
+// Switching lookahead_on -> lookahead_off (already done here) does NOT close the n gap
+// between a 1m and a 1h chart, because the gap isn't caused by intrabar data leaking -
+// it's caused by how much historical data TradingView loads for the CHART's own
+// resolution. "60" is coarser than the chart's own resolution only when the chart is 1h+
+// (direct native read, deep history, e.g. n=440). When the chart is 1m, Pine has to
+// reconstruct 60-min bars from 1-minute data, and the loaded 1-minute history window
+// covers far LESS calendar time than the loaded 60-minute window would for the same bar
+// budget (e.g. 100k bars of 1m data ~ a few months; 100k bars of 60m data ~ a decade) -
+// so the 5y baseline gets truncated earlier on a 1m chart, giving a lower n (e.g. n=150).
+// D/W/M/Y don't have this problem because those resolutions are always coarser than an
+// intraday chart, so Pine fetches them as independent server-side series, not
+// reconstructed from the chart's own loaded bars.
+// There is no script-side fix for this: it's bounded by how much intrabar history
+// TradingView has loaded/serves for your chart's resolution and data plan. The reliable
+// way to get the FULL n for Hourly/Session is to view the chart at 1h (or coarser) while
+// reading those two monitors - at that resolution "60" is read natively and the base(5Y)
+// / SE(SD) / n figures will match what a 1h chart shows regardless of what resolution you
+// switch to afterward, since barstate.islast only pushes the value once per bar close.
+curHourNY_outer = hour(time, nyTz)
+minuteNY_outer  = minute(time, nyTz)
+[selSessRoll, selSessHistArr, selSessHistTimes, selSessBase, selSessBaseSE, selSessNSamp, selSessRetHist, selSessKey] = request.security(syminfo.tickerid, "60", f_allSessions(ROLL_LEN, histBarsToShow, baseLookbackMs, MIN_BASE_SAMPLES, session2Mode, curHourNY_outer), lookahead = barmerge.lookahead_off)
+
+// Hourly (60) - ONE consolidated call, and only the selected hour's tracker is
+// actually maintained unless "Auto" mode requires all 23 to stay warm.
+// Same platform-limit note as Sessions above applies here.
+[selHourRoll, selHourHistArr, selHourHistTimes, selHourBase, selHourBaseSE, selHourNSamp, selHourRetHist, selHourKey] = request.security(syminfo.tickerid, "60", f_allHours(ROLL_LEN, histBarsToShow, baseLookbackMs, MIN_BASE_SAMPLES, hour3Mode), lookahead = barmerge.lookahead_off)
+
+// ============ LIVE (CURRENT, UNCLOSED) TRACKING - Round 4 ============
+// Deliberately separate from everything above: these are cheap, chart-resolution
+// reads of "what has THIS still-forming D/W/M/Y/S/H window returned so far", updated
+// every tick. They feed only the live marker + "live" figure in each header - they
+// never touch retHist/baseRet/histArr, so base(5Y)/roll(10d)/n are completely
+// unaffected and every bucket still keeps its full accumulated history.
+curDOpen = request.security(syminfo.tickerid, "D",   open, lookahead = barmerge.lookahead_on)
+curWOpen = request.security(syminfo.tickerid, "W",   open, lookahead = barmerge.lookahead_on)
+curMOpen = request.security(syminfo.tickerid, "M",   open, lookahead = barmerge.lookahead_on)
+curYOpen = request.security(syminfo.tickerid, "12M", open, lookahead = barmerge.lookahead_on)  // current-bar open only - no historical 12M reads, so the round-2 confirmation-lag issue doesn't apply here
+
+// ---- ROUND 8: open/close TIMES of the current D/W/M/Y window, used only to compute
+// elapsedFrac for diamond X-positioning (see f_elapsedFrac above). Cheap - single
+// current-bar reads, same pattern as curDOpen/curWOpen/etc. above, not used anywhere
+// in the roll/base/live-return math.
+curDOpenTime  = request.security(syminfo.tickerid, "D",   time,       lookahead = barmerge.lookahead_on)
+curDCloseTime = request.security(syminfo.tickerid, "D",   time_close, lookahead = barmerge.lookahead_on)
+curWOpenTime  = request.security(syminfo.tickerid, "W",   time,       lookahead = barmerge.lookahead_on)
+curWCloseTime = request.security(syminfo.tickerid, "W",   time_close, lookahead = barmerge.lookahead_on)
+curMOpenTime  = request.security(syminfo.tickerid, "M",   time,       lookahead = barmerge.lookahead_on)
+curMCloseTime = request.security(syminfo.tickerid, "M",   time_close, lookahead = barmerge.lookahead_on)
+curYOpenTime  = request.security(syminfo.tickerid, "12M", time,       lookahead = barmerge.lookahead_on)
+curYCloseTime = request.security(syminfo.tickerid, "12M", time_close, lookahead = barmerge.lookahead_on)
+
+fracD = f_elapsedFrac(curDOpenTime, curDCloseTime)
+fracW = f_elapsedFrac(curWOpenTime, curWCloseTime)
+fracM = f_elapsedFrac(curMOpenTime, curMCloseTime)
+fracY = f_elapsedFrac(curYOpenTime, curYCloseTime)
+
+liveSessKeyOuter = session2Mode == "Auto (Current Session)" ? f_autoSessionKey(curHourNY_outer) : session2Mode
+[liveSH, liveEH] = f_sessionBounds(liveSessKeyOuter)
+curSOpen = f_track_window_open(liveSH, liveEH, curHourNY_outer)
+fracS = f_periodElapsedFrac(liveSH, liveEH, curHourNY_outer, minuteNY_outer)
+
+liveHourKeyOuter = hour3Mode == "Auto (Current Hour)" ? f_autoHourKey(curHourNY_outer) : hour3Mode
+liveTargetHour   = liveHourKeyOuter == "" ? -1 : int(str.tonumber(str.substring(liveHourKeyOuter, 0, 2)))
+curHOpen = f_track_hour_open(liveTargetHour, curHourNY_outer)
+fracH = liveTargetHour < 0 ? 0.0 : minuteNY_outer / 60.0
+
+liveDRet = f_liveRet(curDOpen, close)
+liveWRet = f_liveRet(curWOpen, close)
+liveMRet = f_liveRet(curMOpen, close)
+liveYRet = f_liveRet(curYOpen, close)
+liveSRet = f_liveRet(curSOpen, close)
+liveHRet = f_liveRet(curHOpen, close)
+
+// ============ PROJECTED ROLL (round 7) - "what would roll(N) read if this window
+// closed right now" ============
+// roll(10d)/roll(5y) etc. are array.stdev() of the last rLen COMPLETED instance
+// returns (retHist). f_liveRet above gives only a single signed return for the
+// still-forming instance - it is NOT itself a stdev and cannot be plotted as a
+// literal continuation of the blue roll line (see the accuracy note near the bottom
+// of this script). The correct same-units projection is: drop the oldest of the
+// rLen-1 most recent COMPLETED returns, append the live (in-progress) return in its
+// place, and take stdev() of that rLen-length window - exactly the same formula the
+// blue line uses at every one of its other points, just with the newest slot still
+// live. This value updates every tick and converges to the real roll(N) print at the
+// moment the window actually closes; before that it is a genuine "as-of-now" read,
+// not a guess about where price will finish.
+//
+// ROUND 9: sqrt-time scaling applied before feeding the live return into stdev().
+// Without scaling the raw partial return is apples-vs-oranges against the full-period
+// completed returns. See f_scaleReturn below and the ROUND 9 changelog at the bottom.
+
+// ---- ROUND 9: sqrt-time scaling helper ----
+// Scales a raw partial-period return up to a full-period-equivalent magnitude using
+// the sqrt-time rule: scaledReturn = rawReturn * sqrt(1 / elapsedFrac).
+// Rationale: volatility (stdev) scales with sqrt(time). A raw return of +18% over
+// 7.5 months of a 12-month year is NOT the same unit as a full-year return of +26%.
+// Multiplying by sqrt(1/frac) annualises the return's volatility contribution,
+// making the live slot truly comparable to the completed full-period slots that
+// surround it in the stdev window.
+// Guard: elapsedFrac < MIN_FRAC means we are in the very first bars of a new period;
+// scaling by sqrt(1/0.001) = 31.6x would be numerically explosive and meaningless.
+// Below MIN_FRAC the raw return is used unchanged (diamond will sit near the blue
+// line, which is the honest answer when almost no time has elapsed).
+f_scaleReturn(float rawRet, float elapsedFrac, bool doScale) =>
+    float result = rawRet
+    float MIN_FRAC = 0.03  // ~1 day of a month, ~11 days of a year, ~1.5 hrs of a day
+    if doScale and not na(rawRet) and not na(elapsedFrac) and elapsedFrac >= MIN_FRAC
+        result := rawRet * math.sqrt(1.0 / elapsedFrac)
+    result
+
+f_projectedRoll(array<float> retHist, float liveVal, int rLen) =>
+    float result = na
+    if not na(liveVal) and not na(retHist) and array.size(retHist) == rLen
+        array<float> proj = array.copy(retHist)
+        array.shift(proj)          // drop the oldest completed return
+        array.push(proj, liveVal)  // slot in today's/this window's live return
+        result := array.stdev(proj, false)
+    result
+
+liveDRoll = f_projectedRoll(dailyRetHist,   f_scaleReturn(liveDRet, fracD, scaleReturnSqrt), ROLL_LEN)
+liveWRoll = f_projectedRoll(weeklyRetHist,  f_scaleReturn(liveWRet, fracW, scaleReturnSqrt), ROLL_LEN_W)
+liveMRoll = f_projectedRoll(monthlyRetHist, f_scaleReturn(liveMRet, fracM, scaleReturnSqrt), ROLL_LEN_M)
+liveYRoll = f_projectedRoll(yearlyRetHist,  f_scaleReturn(liveYRet, fracY, scaleReturnSqrt), ROLL_LEN_Y)
+liveSRoll = f_projectedRoll(selSessRetHist, f_scaleReturn(liveSRet, fracS, scaleReturnSqrt), ROLL_LEN)
+liveHRoll = f_projectedRoll(selHourRetHist, f_scaleReturn(liveHRet, fracH, scaleReturnSqrt), ROLL_LEN)
+
+// ============ DRAWING STORAGE ============
+
+var line[]  lineArr = array.new<line>()
+var box[]   boxArr  = array.new<box>()
+var label[] lblArr  = array.new<label>()
+
+// ============ ACTIVE PANEL (header + rolling-history chart) ============
+// labelMode: "month" = label at each MONTH transition (used by D/W/Session/Hourly,
+// where each column is a day/week/session/hour). "yearOfMonth" / "yearEach" = label at
+// each YEAR transition (used by Monthly/Yearly). Both year-based modes use the SAME
+// transition-check logic (only label when the year actually changes from the previous
+// point) - this fixes doubled/duplicated year labels.
+//
+// dynamicSpacing: when true (Yearly only), the n actual points present at draw time are
+// spread evenly across the FULL panel width (xS..xE) instead of being placed with a
+// pre-computed, assumed-count column spacing - keeps Yearly's labels evenly distributed
+// regardless of how many yearly points actually exist.
+//
+// liveVal/liveColorV (round 4): optional extra point plotted at the panel's right edge
+// showing the CURRENT, still-forming instance's return - separate from the
+// completed-instance history in histArr. na liveVal simply skips it.
+//
+// showLiveLabelV / showLiveMarkerV / showLiveSquareV (round 5): the three live features
+// are now independently toggleable:
+//   - showLiveLabelV  -> the "   live ##%" text appended to the header
+//   - showLiveMarkerV -> the ◆ diamond + dotted lead-line on the rolling-history chart
+//   - showLiveSquareV -> (round 6) mutually exclusive with the static square - ON
+//                         recolors the single ■ every tick from the live move; OFF
+//                         reverts it to reflecting only the last COMPLETED instance's
+//                         regime.
+//
+// elapsedFrac (round 8): 0..1 fraction of the current still-forming period that has
+// elapsed. Used ONLY to place the diamond's X position between the last completed
+// column and the next (not-yet-existing) column - i.e. it visually "walks toward"
+// where the next blue-line point will land as time passes within the period. Does not
+// affect liveRollProj's value, the axis scaling logic beyond min/max inclusion, or any
+// other math.
+f_drawActivePanel(row, fullH, uH, gapU, name, lastRoll, baseVal, baseSE, nSamp, histArr, histTimes, elTh, coTh, nDays, colSp, xOffV, showNeg, hdrSize, drawCI, z, ciColor, labelMode, dynamicSpacing, showNSampV, liveVal, liveRollProj, liveColorV, showLiveLabelV, showLiveRollV, showLiveMarkerV, showLiveSquareV, elapsedFrac) =>
+    bY  = fullH - (row - 1) * (uH + gapU) - uH
+    top = bY + uH
+    xS  = bar_index + xOffV
+    xE  = xS + (nDays - 1) * colSp
+    xMid = math.round((xS + xE) / 2.0)
+
+    float ciLo = na
+    float ciHi = na
+    if not na(baseVal) and not na(baseSE)
+        ciLo := baseVal - z * baseSE
+        ciHi := baseVal + z * baseSE
+
+    // Round 8: widen the box's right edge by one column when the live marker is on,
+    // so the diamond (which can now sit up to one column past the last completed
+    // point) stays visually inside the panel instead of poking through its border.
+    boxRightPad = showLiveMarkerV ? colSp : 0
+    array.push(boxArr, box.new(xS - 3, top, xE + 3 + boxRightPad, bY, bgcolor = backgroundcolor, border_color = bordercolorr))
+
+    n = na(histArr) ? 0 : array.size(histArr)
+
+    // Per-point x positions: dynamic (evenly spread actual n across xS..xE) for Yearly,
+    // fixed/right-aligned (rolling-window style) for every other monitor.
+    var array<int> xPos = array.new_int(0)
+    array.clear(xPos)
+    if n > 0
+        if dynamicSpacing
+            for i = 0 to n - 1
+                xp = n > 1 ? math.round(xS + i * (xE - xS) / (n - 1)) : xMid
+                array.push(xPos, xp)
+        else
+            startCol = math.max(nDays - n, 0)
+            for i = 0 to n - 1
+                array.push(xPos, xS + (startCol + i) * colSp)
+
+    if n > 0
+        mn  = array.min(histArr)
+        mx  = array.max(histArr)
+        // Round 4: fold the live value into the min/max scan so it never gets clipped
+        // by a panel scale sized only for completed instances. Only relevant when the
+        // live marker is actually being drawn on this scale.
+        if showLiveMarkerV and not na(liveRollProj)
+            mn := math.min(mn, liveRollProj)
+            mx := math.max(mx, liveRollProj)
+        float lo = na
+        float hi = na
+        if na(baseVal)
+            lo := mn * 0.9
+            hi := mx * 1.1
+        else if showNeg
+            rawLo = math.min(mn, math.min(baseVal, -baseVal))
+            rawHi = math.max(mx, baseVal)
+            padHi = not na(ciHi) ? math.max(rawHi, ciHi) : rawHi
+            padLo = not na(ciLo) ? math.min(rawLo, -ciHi) : rawLo
+            pad = (padHi - padLo) * 0.1
+            lo := padLo - pad
+            hi := padHi + pad
+        else
+            rawLo = math.min(mn, baseVal)
+            rawHi = not na(ciHi) ? math.max(mx, ciHi) : math.max(mx, baseVal)
+            lo := rawLo * 0.9
+            hi := rawHi * 1.1
+        rng = hi - lo
+
+        if not na(baseVal)
+            fracBase = rng > 0 ? (baseVal - lo) / rng : 0.5
+            yBase = bY + fracBase * uH
+
+            if drawCI and not na(ciLo) and not na(ciHi)
+                fracLo = rng > 0 ? (ciLo - lo) / rng : 0.5
+                fracHi = rng > 0 ? (ciHi - lo) / rng : 0.5
+                yCiLo = bY + fracLo * uH
+                yCiHi = bY + fracHi * uH
+                array.push(boxArr, box.new(xS, yCiHi, xE, yCiLo, bgcolor = ciColor, border_color = color.new(color.white, 100)))
+
+            array.push(lineArr, line.new(xS, yBase, xE, yBase, color = SDcolor, width = 1))
+
+            if showNeg
+                fracNeg = rng > 0 ? (-baseVal - lo) / rng : 0.5
+                yNeg = bY + fracNeg * uH
+                array.push(lineArr, line.new(xS, yNeg, xE, yNeg, color = SDcolor, width = 1, style = line.style_dashed))
+
+        if n >= 2
+            for i = 0 to n - 2
+                v1 = array.get(histArr, i)
+                v2 = array.get(histArr, i + 1)
+                f1 = rng > 0 ? (v1 - lo) / rng : 0.5
+                f2 = rng > 0 ? (v2 - lo) / rng : 0.5
+                x1 = array.get(xPos, i)
+                x2 = array.get(xPos, i + 1)
+                y1 = bY + f1 * uH
+                y2 = bY + f2 * uH
+                array.push(lineArr, line.new(x1, y1, x2, y2, color = linecolor, width = 2))
+
+        // Round 4/8: live marker - a dotted lead-line from the last completed instance
+        // out to a diamond, plotted at the live projected roll's position on the SAME
+        // scale as the historical series. Round 8: the diamond's X position now walks
+        // from the last completed column toward the NEXT column as elapsedFrac goes
+        // 0 -> 1, instead of always sitting at the fixed right edge xE - so it visually
+        // approximates where the next blue-line point will land as the period
+        // progresses.
+        if showLiveMarkerV and not na(liveRollProj)
+            fracLive = rng > 0 ? (liveRollProj - lo) / rng : 0.5
+            yLive = bY + fracLive * uH
+            xLastHist = n > 0 ? array.get(xPos, n - 1) : xS
+            xLive = math.round(xLastHist + elapsedFrac * colSp)
+            if n > 0
+                fracLastHist = rng > 0 ? (array.get(histArr, n - 1) - lo) / rng : 0.5
+                yLastHist = bY + fracLastHist * uH
+                array.push(lineArr, line.new(xLastHist, yLastHist, xLive, yLive, color = liveColorV, width = 1, style = line.style_dotted))
+            array.push(lblArr, label.new(xLive, yLive, "◆", xloc.bar_index, yloc.price, color = color.new(color.black, 100), textcolor = liveColorV, style = label.style_label_center, size = size.tiny))
+
+        for i = 0 to n - 1
+            t  = array.get(histTimes, i)
+            if labelMode == "yearEach" or labelMode == "yearOfMonth"
+                yr = year(t, nyTz)
+                isTransition = i == 0 or year(array.get(histTimes, math.max(i - 1, 0)), nyTz) != yr
+                if isTransition
+                    x = array.get(xPos, i)
+                    array.push(lblArr, label.new(x, bY, str.tostring(yr), xloc.bar_index, yloc.price, color = color.new(color.black, 100), textcolor = color.gray, style = label.style_label_up, size = size.tiny))
+            else
+                mo = month(t, nyTz)
+                isTransition = i == 0 or month(array.get(histTimes, math.max(i - 1, 0)), nyTz) != mo
+                if isTransition
+                    x = array.get(xPos, i)
+                    array.push(lblArr, label.new(x, bY, array.get(monthNames, mo - 1), xloc.bar_index, yloc.price, color = color.new(color.black, 100), textcolor = color.gray, style = label.style_label_up, size = size.tiny))
+
+    ratio = (not na(lastRoll) and not na(baseVal) and baseVal != 0) ? lastRoll / baseVal : na
+    dotColor = na(ratio) ? color.gray : ratio > elTh ? color.red : ratio < coTh ? color.green : color.blue
+    rollStr  = na(lastRoll) ? "n/a" : str.tostring(lastRoll * 100, "#.###") + "%"
+    baseStr  = na(baseVal) ? "n/a (warming up)" : str.tostring(baseVal * 100, "#.###") + "%"
+    ciStr    = (na(ciLo) or na(ciHi)) ? "" : " [" + str.tostring(ciLo * 100, "#.##") + "%-" + str.tostring(ciHi * 100, "#.##") + "%]"
+    nSampStr = not showNSampV ? "" : "   n=" + (na(nSamp) ? "0" : str.tostring(nSamp))
+    liveStr  = (not showLiveLabelV or na(liveVal)) ? "" : "   live " + str.tostring(liveVal * 100, "#.###") + "%"
+    // Round 7: numeric readout of the diamond's actual plotted value - same units as
+    // roll(10d)/base(5Y), so it can be read/compared directly (e.g. against ratioStr).
+    // Round 9 (10): now gated on showLiveRollV independently of showLiveLabelV.
+    rollProjStr = (not showLiveRollV or na(liveRollProj)) ? "" : "   roll' " + str.tostring(liveRollProj * 100, "#.###") + "%"
+    ratioStr = na(ratio) ? "n/a" : "x" + str.tostring(ratio, "#.##")
+    headerTxt = name + "   roll " + rollStr + "   base " + baseStr + nSampStr + liveStr + rollProjStr + "   " + ratioStr
+//    headerTxt = name + "   roll " + rollStr + "   base " + baseStr + ciStr + "   " + ratioStr    
+    array.push(lblArr, label.new(xMid, top, headerTxt, xloc.bar_index, yloc.price, color = color.new(color.black, 100), textcolor = headercolor, style = label.style_label_down, size = hdrSize, textalign = text.align_center))
+
+    // Round 6/7: Live Square and the static regime square are MUTUALLY EXCLUSIVE -
+    // only one ■ is ever drawn, at the same right-edge slot. When showLiveSquareV is
+    // on, it recolors every tick using liveRollProj/baseVal - the SAME-units "next
+    // roll(N) point, projected from where price sits right now, divided by base(5Y)"
+    // ratio (see the projected-roll note above liveDRoll/liveWRoll/etc.). When off,
+    // the square falls back to the ORIGINAL behavior: reflecting only the last
+    // COMPLETED instance's ratio ("stays as yesterday").
+    if showLiveSquareV
+        liveRatio = (not na(liveRollProj) and not na(baseVal) and baseVal != 0) ? liveRollProj / baseVal : na
+        liveDotColor = na(liveRatio) ? color.gray : liveRatio > elTh ? color.red : liveRatio < coTh ? color.green : color.blue
+        array.push(lblArr, label.new(xE, top, "■", xloc.bar_index, yloc.price, color = color.new(color.black, 100), textcolor = liveDotColor, style = label.style_label_down, size = size.small))
+    else
+        array.push(lblArr, label.new(xE, top, "■", xloc.bar_index, yloc.price, color = color.new(color.black, 100), textcolor = dotColor, style = label.style_label_down, size = size.small))
+
+// ============ INACTIVE PANEL (window closed - blank placeholder) ============
+f_drawInactivePanel(row, fullH, uH, gapU, name, msg, nDays, colSp, xOffV) =>
+    bY  = fullH - (row - 1) * (uH + gapU) - uH
+    top = bY + uH
+    xS  = bar_index + xOffV
+    xE  = xS + (nDays - 1) * colSp
+    xMid = math.round((xS + xE) / 2.0)
+
+    array.push(boxArr, box.new(xS - 3, top, xE + 3, bY, bgcolor = color.new(color.gray, 92), border_color = color.new(color.gray, 70)))
+    array.push(lblArr, label.new(xMid, top, name, xloc.bar_index, yloc.price, color = color.new(color.black, 100), textcolor = color.gray, style = label.style_label_down, size = size.small, textalign = text.align_center))
+    array.push(lblArr, label.new(xMid, (top + bY) / 2, msg, xloc.bar_index, yloc.price, color = color.new(color.black, 100), textcolor = color.gray, style = label.style_label_center, size = size.small, textalign = text.align_center))
+
+f_regimeName(float roll, float base) =>
+    ratio = (not na(roll) and not na(base) and base != 0) ? roll / base : na
+    na(ratio) ? "warming" : ratio > elevatedTh ? "expansion" : ratio < compressedTh ? "compression" : "normal"
+
+// ============ CLEAR & DRAW (last bar only) ============
+if barstate.islast
+    for l in lineArr
+        line.delete(l)
+    array.clear(lineArr)
+    for b in boxArr
+        box.delete(b)
+    array.clear(boxArr)
+    for lb in lblArr
+        label.delete(lb)
+    array.clear(lblArr)
+
+    fullR = fullH_D - fullL_D
+    fullR := fullR > 0 ? fullR : atr_D * 20
+    uH    = fullR * panelHeightPct
+    gapU  = fullR * panelGapPct
+
+    rowIdx = 1
+    string rY = ""
+    string rM = ""
+    string rW = ""
+    string rD = ""
+    string rS = ""
+    string rH = ""
+
+    // ---- Monitor Y: Yearly ----
+    if showY
+        f_drawActivePanel(rowIdx, fullH_D, uH, gapU, "Y", yearlyRoll, yearlyBase, yearlyBaseSE, yearlyNSamp, yearlyHistArr, yearlyHistTimes, elevatedTh, compressedTh, yearlyNDays, barSpacing, xOff, show1SDNeg, headerSize, showCIBand, ciZ, CIbandcolor, "yearEach", true, showNSamp, liveYRet, liveYRoll, liveColor, showLiveLabel, showLiveRoll, showLiveMarker, showLiveSquare, fracY)
+        rY := "   Y: " + f_regimeName(yearlyRoll, yearlyBase)
+        rowIdx += 1
+
+    // ---- Monitor M: Monthly ----
+    if showM
+        f_drawActivePanel(rowIdx, fullH_D, uH, gapU, "M", monthlyRoll, monthlyBase, monthlyBaseSE, monthlyNSamp, monthlyHistArr, monthlyHistTimes, elevatedTh, compressedTh, histBarsToShow, barSpacing, xOff, show1SDNeg, headerSize, showCIBand, ciZ, CIbandcolor, "yearOfMonth", false, showNSamp, liveMRet, liveMRoll, liveColor, showLiveLabel, showLiveRoll, showLiveMarker, showLiveSquare, fracM)
+        rM := "   M: " + f_regimeName(monthlyRoll, monthlyBase)
+        rowIdx += 1
+
+    // ---- Monitor W: Weekly ----
+    if showW
+        f_drawActivePanel(rowIdx, fullH_D, uH, gapU, "W", weeklyRoll, weeklyBase, weeklyBaseSE, weeklyNSamp, weeklyHistArr, weeklyHistTimes, elevatedTh, compressedTh, histBarsToShow, barSpacing, xOff, show1SDNeg, headerSize, showCIBand, ciZ, CIbandcolor, "month", false, showNSamp, liveWRet, liveWRoll, liveColor, showLiveLabel, showLiveRoll, showLiveMarker, showLiveSquare, fracW)
+        rW := "   W: " + f_regimeName(weeklyRoll, weeklyBase)
+        rowIdx += 1
+
+    // ---- Monitor 1: Daily ----
+    if show1
+        f_drawActivePanel(rowIdx, fullH_D, uH, gapU, "D", dailyRoll, dailyBase, dailyBaseSE, dailyNSamp, dailyHistArr, dailyHistTimes, elevatedTh, compressedTh, histBarsToShow, barSpacing, xOff, show1SDNeg, headerSize, showCIBand, ciZ, CIbandcolor, "month", false, showNSamp, liveDRet, liveDRoll, liveColor, showLiveLabel, showLiveRoll, showLiveMarker, showLiveSquare, fracD)
+        rD := "   D: " + f_regimeName(dailyRoll, dailyBase)
+        rowIdx += 1
+
+    // ---- Monitor 2: Session ----
+    if show2
+        if selSessKey == "Asia" or selSessKey == "London" or selSessKey == "NY AM" or selSessKey == "NY PM"
+            f_drawActivePanel(rowIdx, fullH_D, uH, gapU, str.upper(selSessKey), selSessRoll, selSessBase, selSessBaseSE, selSessNSamp, selSessHistArr, selSessHistTimes, elevatedTh, compressedTh, histBarsToShow, barSpacing, xOff, show1SDNeg, headerSize, showCIBand, ciZ, CIbandcolor, "month", false, showNSamp, liveSRet, liveSRoll, liveColor, showLiveLabel, showLiveRoll, showLiveMarker, showLiveSquare, fracS)
+            rS := "   S: " + f_regimeName(selSessRoll, selSessBase)
+        else
+            f_drawInactivePanel(rowIdx, fullH_D, uH, gapU, "SESSION MONITOR", "outside covered sessions (16:00-19:59 NY gap)", histBarsToShow, barSpacing, xOff)
+        rowIdx += 1
+
+    // ---- Monitor 3: Hourly ----
+    if show3
+        if selHourKey != ""
+            f_drawActivePanel(rowIdx, fullH_D, uH, gapU, "H " + f_hourShort(selHourKey), selHourRoll, selHourBase, selHourBaseSE, selHourNSamp, selHourHistArr, selHourHistTimes, elevatedTh, compressedTh, histBarsToShow, barSpacing, xOff, show1SDNeg, headerSize, showCIBand, ciZ, CIbandcolor, "month", false, showNSamp, liveHRet, liveHRoll, liveColor, showLiveLabel, showLiveRoll, showLiveMarker, showLiveSquare, fracH)
+            rH := "   H: " + f_regimeName(selHourRoll, selHourBase)
+        else
+            f_drawInactivePanel(rowIdx, fullH_D, uH, gapU, "HOURLY MONITOR", "outside covered hours (16:00-17:59 NY gap)", histBarsToShow, barSpacing, xOff)
+        rowIdx += 1
+
+    if showRegimeStatus and (showY or showM or showW or show1 or show2 or show3)
+        regimeTxt = "Regime" + rY + rM + rW + rD + rS + rH
+        array.push(lblArr, label.new(bar_index + xOff, fullH_D + gapU, regimeTxt, xloc.bar_index, yloc.price, style = label.style_label_left, color = color.new(color.black, 10), textcolor = headercolor, size = headerSize))
+
+//Script By: x.com/Desiringmachine
+// =====================================================================================
+// DYNAMIC VERSION - STATE 1 (ETH)
+//   - "roll(10d)"  : rolling stdev of the last ROLL_LEN instances.
+//   - "base(5Y)"   : rolling stdev of every instance falling within the last
+//                    baseLookbackYears years (a time-based window, not a fixed count).
+//   - "SE(SD)"     : standard error of the base(5Y) estimate, SE(SD) ~= SD/sqrt(2n),
+//                    shown as a [lo%-hi%] range in the header and a shaded band on chart.
+//   - "n"          : the raw sample count feeding base(5Y)/SE(SD), surfaced via the
+//                    "N Sample" toggle for direct cross-timeframe comparison / debugging.
+//   - "live"       : (round 4) the CURRENT, still-forming instance's return so far,
+//                    updated every tick - see round 4 note below.
+// =====================================================================================
+// SE(SD) - WHY YEARLY/MONTHLY BANDS ARE WIDER (EXPECTED, NOT A BUG)
+// SE(SD) ~= SD / sqrt(2n) - a wide band = baseline still uncertain (small n), a tight
+// band = trustworthy (large n). Yearly can only ever accumulate ~1 instance per calendar
+// year, so its SE is inherently wide. Not fixable in code.
+// =====================================================================================
+// LIVE TRACKING - ACCURACY NOTE (read before trusting the ◆/live figures)
+// The blue "roll" line and the yellow "base(5Y)" line are BOTH volatility statistics -
+// they are array.stdev() of a window of the last rLen COMPLETED instance returns, so
+// they are always >= 0 and measured in "typical dispersion of returns" units.
+// (Round 7) The diamond (◆) and Live Square no longer use the raw live return
+// (liveVal/liveDRet/etc - a single signed instance return) for their position/color.
+// They use liveRollProj (liveDRoll/liveWRoll/liveMRoll/liveYRoll/liveSRoll/liveHRoll -
+// see f_projectedRoll, defined just after the live-return block), which is a REAL
+// array.stdev() computed the exact same way the blue line's other points are: take
+// the rLen-1 most recent COMPLETED returns, append the current still-forming return in
+// the newest slot, and take stdev() of that rLen-length window. This is the
+// mathematically correct answer to "what would roll(N) print if this window closed at
+// the current price" - not an approximation or a proxy. It updates every tick and is
+// exact for the price level at that tick; it converges to the actual blue-line print
+// the instant the window genuinely closes. It is NOT a prediction of where price will
+// finish - only of what the stdev formula evaluates to right now.
+// Three honest limits remain:
+//   1) Warm-up: liveRollProj is na until that bucket has a FULL rLen-length completed
+//      window (same "n/a (warming up)" gate as roll(10d)/base itself) - the diamond
+//      simply doesn't draw until then, rather than showing a placeholder number.
+//   2) Sample size per period: D/S/H update this window every close (fast, ROLL_LEN=
+//      10 completed instances feed it), so intraday the diamond tracks meaningfully
+//      within minutes of a session/hour starting. M/W update once per week/month
+//      close, and Y only once per YEAR (ROLL_LEN_Y=5) - so on those panels the
+//      diamond barely moves in the first days of a new month/week/year (the live
+//      slot's return is still near zero) and only becomes informative as that period
+//      progresses toward its own close. This is a real sampling-frequency limit, not a
+//      bug: a monthly/yearly stdev literally cannot update faster than a month/year.
+//   3) (Round 9) Partial-vs-full-period comparability: FIXED by sqrt-time scaling.
+//      The raw live return is multiplied by sqrt(1/elapsedFrac) before entering
+//      f_projectedRoll, putting it in the same annualised-volatility units as the
+//      completed full-period returns. The diamond now correctly separates from the
+//      last blue-line point as the period matures, reflecting the running annualised
+//      rate rather than the raw cumulative move. Toggle: "Scale ◆ Sqrt-Time" in
+//      Regime Status settings (default ON). See ROUND 9 changelog at the bottom.
+// The header's "live ##%" text (liveStr) is unchanged and still shows the raw signed
+// return for that reason - direction/magnitude-so-far context is still available even
+// while liveRollProj is still na or barely moved. The "roll' ##%" header figure
+// (rollProjStr) shows the numeric value the diamond is actually plotted at, for direct
+// comparison against roll/base/ratio in the same row.
+// The Live Square uses liveRollProj/baseVal directly - a literal, same-units "how many
+// base-sigmas has price moved so far, projected to this instant's window" ratio,
+// exactly comparable to the static square's lastRoll/baseVal. As of round 6 the Live
+// Square and the static square are mutually exclusive (see round 6 note below) rather
+// than both being drawn at once.
+// =====================================================================================
+// ROUND 2 CHANGES:
+// 1) Yearly: replaced native "12M" reads with f_trackYearlyFromDaily (derives calendar-
+//    year returns directly from confirmed DAILY bars) - fixes the ~2-year confirmation
+//    lag and any "12M" bar-construction irregularities around contract-roll dates.
+// 2) Hourly/Session header format: "H 09" instead of "H 09:00" (f_hourShort()).
+// 3) Both "60"-resolution security() calls switched lookahead_on -> lookahead_off
+//    (harmless/cleaner, matches the confirmed-bar-only reads), see round 3 note below
+//    for why this alone doesn't equalize N Sample across chart TF.
+// =====================================================================================
+// ROUND 3 - N Sample mismatch for Hourly/Session across chart TF:
+// Confirmed via retest that lookahead_off did NOT close the gap (still ~150 on a 1m
+// chart vs ~440 on a 1h chart). Root cause identified: this is NOT a script bug. "60"
+// is coarser than the chart only when the chart itself is 1h+, in which case Pine reads
+// native 60-minute bars directly with full available history. When the chart is 1m,
+// Pine must reconstruct 60-minute bars from 1-minute data, and the loaded 1-minute
+// history covers far less calendar time than the loaded 60-minute history would for the
+// same underlying bar budget - so the 5-year baseline window gets truncated earlier,
+// producing a lower n. D/W/M/Y never show this because those resolutions are always
+// coarser than an intraday chart and are fetched as independent server-side series, not
+// reconstructed from the chart's own loaded bars. There is no request.security()
+// parameter, barstate condition, or var-state pattern that can override how much
+// intrabar history TradingView loads for a given chart resolution/plan - so the n gap
+// for Hourly/Session cannot be equalized purely in script. The reliable workaround:
+// check Hourly/Session's base(5Y)/SE(SD)/n while the chart itself is set to 1h or
+// coarser, where "60" is read natively.
+// =====================================================================================
+// ROUND 4 - "only track the current H/S/D/W/M/Y live":
+// Investigated collapsing Session/Hourly Auto mode down to a single tracker for
+// whichever bucket is currently active, dropping the other 3/22. Rejected: base(5Y)/
+// roll(10d)/n for each bucket only exist because that bucket keeps accumulating
+// instances even while a DIFFERENT bucket is the one being displayed. Auto mode
+// rotates through all buckets every calendar day, so tracking "only current" would
+// reset each bucket's baseline to n=0 every time Auto switches into it - base(5Y)
+// would show "n/a (warming up)" indefinitely instead of a mature multi-year figure.
+// D/W/M/Y were already single-tracker to begin with (no parallel buckets), so this
+// only would have applied to Session/Hourly, and only in Auto mode - a Fixed
+// session/hour selection already only builds the one bucket it needs.
+// What WAS added instead: a genuinely new "live" layer (f_track_window_open /
+// f_track_hour_open / curDOpen / curWOpen / curMOpen / curYOpen), modeled on the
+// separate Hourly Distro indicator's f_track_session_chart / f_track_hour_chart /
+// f_track_chart_range pattern. This tracks each window's OPEN at chart resolution
+// and derives a live % return every tick, shown as a header figure + a dotted-line
+// diamond marker at each panel's right edge. It runs alongside - not instead of -
+// the existing base(5Y)/roll(10d) machinery, so nothing about the baseline changed.
+// =====================================================================================
+// ROUND 5 - split "Live (current bar)" into three independent toggles, + Live Square:
+// 1) showLive (single toggle) replaced with showLiveLabel / showLiveMarker /
+//    showLiveSquare - the header "live ##%" text, the ◆ diamond+dotted-line, and a new
+//    second ■ can now each be switched on/off independently.
+// 2) Added the Live Square: a SECOND ■ drawn just left of the existing one. The
+//    existing ■ is untouched - it still only updates when an instance actually closes
+//    ("stays as yesterday"). The new one recolors every tick using
+//    math.abs(liveVal)/baseVal vs the same Elevated/Compressed thresholds used
+//    everywhere else, so red/green/blue on the live square means the same thing as on
+//    the regular square, just computed from the still-forming instance instead of the
+//    last completed one.
+// Toggles: "Live Label" / "Live Marker ◆" / "Live Square ■" under the Regime Status
+// group.
+// =====================================================================================
+// ROUND 6 - diamond continuity + mutually exclusive squares:
+// 1) Diamond (◆) now plots math.abs(liveVal) instead of the signed liveVal, both in
+//    the mn/mx scan that sizes the panel axis and in its own Y-position. It reads as
+//    a non-negative magnitude continuing the blue roll(10d) series on the same scale,
+//    and no longer drags the axis negative on a down move. Header "live ##%" text is
+//    unaffected and still shows the signed return. The live value was already, and
+//    remains, excluded from the roll(10d)/base(5Y) history arrays - it's overlay-only.
+// 2) Live Square and the static regime square are now mutually exclusive: exactly one
+//    ■ is drawn per panel, at the same right-edge slot. showLiveSquare ON -> live
+//    (recolors every tick vs base(5Y)); OFF -> static (last completed instance only,
+//    "stays as yesterday" - the pre-round-5 behavior).
+// =====================================================================================
+// ROUND 7 - diamond/Live Square now plot a REAL projected roll(N), not a raw return:
+// Every tracking function (f_trackDaily_HTF, f_trackSession_HTF, f_trackYearlyFromDaily)
+// and their wrappers (f_allSessions, f_allHours) now also return a copy of retHist -
+// the exact rLen-length window of completed returns roll(N) is computed from. New
+// helper f_projectedRoll(retHist, liveVal, rLen) drops the oldest return from that
+// window, appends the current live (still-forming) return, and takes array.stdev() of
+// the result - the same formula the blue line uses everywhere else, just with the
+// newest point still live. This feeds liveDRoll/liveWRoll/liveMRoll/liveYRoll/
+// liveSRoll/liveHRoll, which f_drawActivePanel (new liveRollProj param) now uses for
+// the diamond's Y-position/axis-fit AND the Live Square's ratio, replacing the round-6
+// math.abs(liveVal) approximation. liveVal/liveDRet/etc are unchanged and still drive
+// only the header's "live ##%" raw-return text. See the "LIVE TRACKING - ACCURACY
+// NOTE" above for the remaining honest limits (warm-up gating, per-period sample
+// frequency, partial-vs-full-period comparability).
+// =====================================================================================
+// ROUND 9 CHANGES:
+// 1) BUG FIX - xLive type error: line.new/label.new require a series int for bar-index
+//    X coordinates. xLive was computed as float (xLastHist int + elapsedFrac float *
+//    colSp int). Fixed by wrapping in math.round(). Resolves the two compile errors
+//    "Cannot call line.new with argument x2=xLive... series float used but series int
+//    expected" that appeared after Round 8 shipped.
+// 2) sqrt-time scaling for the live (partial-period) return fed into f_projectedRoll,
+//    applied to ALL SIX monitors (D, S, H, W, M, Y):
+//    - Root cause of "diamond sits too close to blue line": the raw live return is a
+//      PARTIAL-period value (e.g. +18% over 7.5 months of a 12-month year). When placed
+//      inside stdev() alongside FULL-period completed returns (+26%, -48%, +53%, +24%,
+//      +19%), the partial return is numerically smaller simply because less time has
+//      elapsed - stdev() shrinks toward the existing blue-line value regardless of the
+//      actual volatility rate. This is an apples-vs-oranges comparison, not a regime
+//      signal.
+//    - Fix: f_scaleReturn(rawRet, elapsedFrac, doScale) multiplies the raw return by
+//      sqrt(1 / elapsedFrac) before it enters f_projectedRoll. This is the standard
+//      sqrt-time volatility rule: sigma scales with sqrt(T), so a partial return must be
+//      up-scaled by sqrt(1/frac) to put it in the same units as a full-period return.
+//      Example: +18% raw, fracY=0.63 (Aug in a calendar year) → scaled = 18% × 1.26 =
+//      22.7%. stdev([-48.39%, +53%, +24%, +19%, +22.7%]) ≈ 30% instead of ≈ 25%,
+//      placing the diamond visibly above the last completed blue-line point and correctly
+//      reflecting that 2026 is tracking at an elevated annualised rate.
+//    - Guard: elapsedFrac < 0.03 (first ~1 day of a month, ~11 days of a year, ~1.5 hrs
+//      of a day) → raw return used unchanged to prevent sqrt(1/0.001)≈31x blow-up.
+//    - Toggle: "Scale ◆ Sqrt-Time" (default ON) in Regime Status settings group. OFF
+//      restores the old raw-return behaviour for comparison.
+// 3) Why sqrt-time, not linear? Linear scaling assumes a constant drift rate
+//    (return/day = constant), which overstates the projection significantly, especially
+//    early in the period. Sqrt-time is the theoretically correct annualisation for
+//    volatility (standard deviation) under a random-walk / Brownian motion assumption -
+//    it is the same rule used to annualise daily vol (×sqrt(252)) everywhere in finance.
+//    Both are approximations; sqrt-time is the standard convention for vol comparisons.
+// =====================================================================================
