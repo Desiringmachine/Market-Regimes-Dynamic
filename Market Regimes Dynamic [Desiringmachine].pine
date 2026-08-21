@@ -6,23 +6,6 @@ ROLL_LEN = input.int(10, "Roll (10d)", tooltip = "Rolling window: last N instanc
 baseLookbackYears = input.int(5, "Base (5Y)", tooltip = "How many years of history are used to compute the Daily/Session/Hourly panels' dynamic baseline stdev (base(5Y)). Default 5y - increase/decrease as needed; a longer ticker history gives a more stable baseline.", inline="1", group = "Roll / Base - Daily / Session / Hourly", display = display.none)
 MIN_BASE_SAMPLES = 30   // minimum accumulated instances before the dynamic baseline is trusted (shows n/a until then)
 
-// ---- ROUND 8: Weekly / Monthly / Yearly now get their OWN roll length + base lookback,
-// independent of the D/S/H ones above. Defaults match the D/S/H defaults (10 / 5y) for
-// Weekly and Monthly, and match the previous hardcoded Yearly constants (5 / 30y) for
-// Yearly - so nothing changes numerically on first load, it's just now editable.
-lbGroupW = "Roll / Base - Weekly"
-ROLL_LEN_W         = input.int(10, "Roll (Weekly)", tooltip = "Rolling window (in weekly instances) used for the Weekly panel's roll(N) figure. Independent of the Daily/Session/Hourly Roll above.", inline="1", group = lbGroupW, display = display.none)
-baseLookbackYearsW = input.int(5, "Base (Weekly, yrs)", tooltip = "Years of history used for the Weekly panel's dynamic baseline stdev. Independent of the Daily/Session/Hourly Base above.", inline="1", group = lbGroupW, display = display.none)
-
-lbGroupM = "Roll / Base - Monthly"
-ROLL_LEN_M         = input.int(10, "Roll (Monthly)", tooltip = "Rolling window (in monthly instances) used for the Monthly panel's roll(N) figure. Independent of the Daily/Session/Hourly Roll above.", inline="1", group = lbGroupM, display = display.none)
-baseLookbackYearsM = input.int(5, "Base (Monthly, yrs)", tooltip = "Years of history used for the Monthly panel's dynamic baseline stdev. Independent of the Daily/Session/Hourly Base above.", inline="1", group = lbGroupM, display = display.none)
-
-lbGroupY = "Roll / Base - Yearly"
-ROLL_LEN_Y         = input.int(5, "Roll (Yearly)", tooltip = "Rolling window (in yearly instances) used for the Yearly panel's roll(N) figure. Was hardcoded to 5 - now editable.", inline="1", group = lbGroupY, display = display.none)
-baseLookbackYearsY = input.int(30, "Base (Yearly, yrs)", tooltip = "Years of history used for the Yearly panel's dynamic baseline stdev. Was hardcoded to 30 - now editable.", inline="1", group = lbGroupY, display = display.none)
-baseLookbackMsY = baseLookbackYearsY * 365.25 * 24.0 * 60.0 * 60.0 * 1000.0
-
 // ============ MONITOR 1 - DAILY ============
 monitor="Monitor 1 -> 6"
 // ============ MONITOR 2 - SESSION ============
@@ -39,10 +22,10 @@ showY = input.bool(false, "Y",inline="3", group = monitor, display = display.non
 
 monitorcolorz="Regime Status"
 showRegimeStatus = input.bool(false, "Regime Status", group = monitorcolorz, display = display.none)
-showLiveLabel  = input.bool(true, "Live Label", tooltip = "Adds a 'live ##%' figure to each panel's HEADER TEXT showing where price sits RIGHT NOW inside the still-forming D/S/H/W/M/Y window, updated every chart tick. Independent of Live Marker / Live Square below. This does NOT change how base(5Y)/roll(10d) are built - those still require every bucket's completed history (see Round 4 note at bottom of script).", inline="live", group = monitorcolorz, display = display.none)
-showLiveRoll   = input.bool(true, "Live Roll'", tooltip = "Adds a 'roll' ##%' figure to each panel's HEADER TEXT showing the projected roll(N) value IF the current still-forming period closed right now - the same number the diamond (◆) is plotted at on the chart. Independent of Live Label / Live Marker / Live Square. Uses sqrt-time scaling when 'Scale ◆ Sqrt-Time' is ON.", inline="live", group = monitorcolorz, display = display.none)
-showLiveMarker = input.bool(true, "Live Marker ◆", tooltip = "Adds a live diamond (◆) + dotted lead-line to each panel's ROLLING-HISTORY CHART showing where price sits RIGHT NOW. Independent of Live Label / Live Square. (Round 8: the diamond's X position now also reflects how much of the current period has elapsed - see Round 8 note at bottom.)", inline="live", group = monitorcolorz, display = display.none)
-showLiveSquare = input.bool(true, "Live Square ■", tooltip = "Toggles which square is drawn in each panel (mutually exclusive with the static square - only one ■ shows at a time). ON: the square updates every tick, colored red/green/blue by how far the current live move sits relative to base(5Y). OFF: the square reflects the last COMPLETED instance's regime only - it 'stays as yesterday'.", inline="live2", group = monitorcolorz, display = display.none)
+showLiveLabel  = input.bool(false, "Live Label", tooltip = "Adds a 'live ##%' figure to each panel's HEADER TEXT showing where price sits RIGHT NOW inside the still-forming D/S/H/W/M/Y window, updated every chart tick. Independent of Live Marker / Live Square below. This does NOT change how base(5Y)/roll(10d) are built - those still require every bucket's completed history (see Round 4 note at bottom of script).", inline="live", group = monitorcolorz, display = display.none)
+showLiveRoll   = input.bool(false, "Live Roll'", tooltip = "Adds a 'roll' ##%' figure to each panel's HEADER TEXT showing the projected roll(N) value IF the current still-forming period closed right now - the same number the diamond (◆) is plotted at on the chart. Independent of Live Label / Live Marker / Live Square. Uses sqrt-time scaling when 'Scale ◆ Sqrt-Time' is ON.", inline="live", group = monitorcolorz, display = display.none)
+showLiveMarker = input.bool(false, "Live Marker ◆", tooltip = "Adds a live diamond (◆) + dotted lead-line to each panel's ROLLING-HISTORY CHART showing where price sits RIGHT NOW. Independent of Live Label / Live Square. (Round 8: the diamond's X position now also reflects how much of the current period has elapsed - see Round 8 note at bottom.)", inline="live", group = monitorcolorz, display = display.none)
+showLiveSquare = input.bool(false, "Live Square ■", tooltip = "Toggles which square is drawn in each panel (mutually exclusive with the static square - only one ■ shows at a time). ON: the square updates every tick, colored red/green/blue by how far the current live move sits relative to base(5Y). OFF: the square reflects the last COMPLETED instance's regime only - it 'stays as yesterday'.", inline="live2", group = monitorcolorz, display = display.none)
 showNSamp = input.bool(false, "N Sample", tooltip = "Show the number of samples (instances) feeding each monitor's base(5Y) baseline in the header, e.g. 'n=482'. Useful for confirming baseline stability / comparing sample counts across timeframes.", inline="1", group = monitorcolorz, display = display.none)
 scaleReturnSqrt = input.bool(true, "Scale ◆ Sqrt-Time", tooltip = "ON (recommended): before feeding the current partial-period return into the projected-roll formula, scale it up by sqrt(1/elapsedFrac) so it is comparable in magnitude to the full-period completed returns that surround it on the blue line. Example: if 7.5 months have elapsed (fracY≈0.63) and the raw return is +18%, the scaled return is 18%×sqrt(1/0.63)≈22.7%, giving the diamond a meaningfully different position from the last blue-line point. OFF: uses the raw partial return (old behaviour), which will always sit artificially close to the blue line early in any period. Minimum elapsed fraction threshold of 3% is applied to prevent blow-up on the very first bars of a new period.", inline="1", group = monitorcolorz, display = display.none)
 // ============ COLORS ============
@@ -76,6 +59,23 @@ xOff           = input.int(20, "Horiz offs", inline="1", group = "Layout", displ
 panelHeightPct = input.float(0.09, "Height", inline="1", group = "Layout", display = display.none)
 panelGapPct    = input.float(0.03, "Gap", inline="1", group = "Layout", display = display.none)
 lookbackRange  = input.int(300, "Daily bars", inline="1", minval = 30, group = "Layout", tooltip = "Number of DAILY bars (not chart bars) used to size the monitors. Anchoring this to the Daily timeframe is what keeps panel size constant regardless of your chart's own timeframe.", display = display.none)
+
+// ---- ROUND 8: Weekly / Monthly / Yearly now get their OWN roll length + base lookback,
+// independent of the D/S/H ones above. Defaults match the D/S/H defaults (10 / 5y) for
+// Weekly and Monthly, and match the previous hardcoded Yearly constants (5 / 30y) for
+// Yearly - so nothing changes numerically on first load, it's just now editable.
+lbGroupW = "Roll / Base - Weekly- Monthly - Yearly"
+ROLL_LEN_W         = input.int(10, "Roll (W)", tooltip = "Rolling window (in weekly instances) used for the Weekly panel's roll(N) figure. Independent of the Daily/Session/Hourly Roll above.", inline="1", group = lbGroupW, display = display.none)
+baseLookbackYearsW = input.int(5, "Base (Yrs)", tooltip = "Years of history used for the Weekly panel's dynamic baseline stdev. Independent of the Daily/Session/Hourly Base above.", inline="1", group = lbGroupW, display = display.none)
+
+lbGroupM = "Roll / Base "
+ROLL_LEN_M         = input.int(10, "Roll (M)", tooltip = "Rolling window (in monthly instances) used for the Monthly panel's roll(N) figure. Independent of the Daily/Session/Hourly Roll above.", inline="2", group = lbGroupW, display = display.none)
+baseLookbackYearsM = input.int(5, "Base (Yrs)", tooltip = "Years of history used for the Monthly panel's dynamic baseline stdev. Independent of the Daily/Session/Hourly Base above.", inline="2", group = lbGroupW, display = display.none)
+
+lbGroupY = "Roll / Base "
+ROLL_LEN_Y         = input.int(5, "Roll (Y)", tooltip = "Rolling window (in yearly instances) used for the Yearly panel's roll(N) figure. Was hardcoded to 5 - now editable.", inline="3", group = lbGroupW, display = display.none)
+baseLookbackYearsY = input.int(30, "Base (Yrs)", tooltip = "Years of history used for the Yearly panel's dynamic baseline stdev. Was hardcoded to 30 - now editable.", inline="3", group = lbGroupW, display = display.none)
+baseLookbackMsY = baseLookbackYearsY * 365.25 * 24.0 * 60.0 * 60.0 * 1000.0
 
 // ============ TIMEZONE ============
 nyTz = "America/New_York"
